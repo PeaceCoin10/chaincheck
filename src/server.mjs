@@ -13,6 +13,7 @@ import express from "express";
 import { paymentMiddleware, x402ResourceServer } from "@x402/express";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { declareDiscoveryExtension, bazaarResourceServerExtension } from "@x402/extensions/bazaar";
 
 const PORT = Number(process.env.PORT ?? 4021);
 const PAY_TO = process.env.PAY_TO ?? "0x436b9d5e6fBd40eC93E881263bE53e59F8755Ba1";
@@ -215,11 +216,43 @@ const routes = {
         freePreview: "GET / -> catalog, GET /health -> status",
       },
     }),
+    extensions: declareDiscoveryExtension({
+      method: "GET",
+      input: { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" },
+      inputSchema: {
+        properties: {
+          address: {
+            type: "string",
+            pattern: "^0x[0-9a-fA-F]{40}$",
+            description: "Base address to screen (contract or EOA)",
+          },
+        },
+        required: ["address"],
+      },
+      output: {
+        example: {
+          address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+          chain: "base",
+          chainId: 8453,
+          contract: {
+            isContract: true,
+            codeSize: 1852,
+            proxySuspect: false,
+            opcodes: { delegatecall: true, selfdestruct: false, callcode: false, staticcall: false },
+            functionSelectors: 5,
+          },
+          verification: { verified: true, match: "exact_match", name: "FiatTokenProxy", compiler: "0.6.12+commit.27d51765" },
+          risk: { score: 22, grade: "B", flags: [{ flag: "delegatecall", weight: 10 }] },
+        },
+      },
+    }),
   },
 };
 
 const facilitator = new HTTPFacilitatorClient({ url: FACILITATOR });
-const resourceServer = new x402ResourceServer(facilitator).register(NETWORK, new ExactEvmScheme());
+const resourceServer = new x402ResourceServer(facilitator)
+  .register(NETWORK, new ExactEvmScheme())
+  .registerExtension(bazaarResourceServerExtension);
 
 const app = express();
 app.disable("x-powered-by");
@@ -254,28 +287,76 @@ const catalog = () => ({
 });
 
 app.get("/", (_req, res) => res.json(catalog()));
-app.get("/.well-known/x402", (_req, res) => res.json(catalog()));
+
+/**
+ * x402scan / directory discovery (spec: Merit-Systems/x402scan docs/DISCOVERY.md).
+ * Shape must be {version, resources:[absolute urls]} — a catalog-shaped body is ignored.
+ */
+/** Public base URL. cloudflared quick tunnels often omit x-forwarded-proto, so
+ *  anything that is not a local/LAN host is assumed to be served over TLS. */
+const publicBase = (req) => {
+  const host = req.get("host") ?? "";
+  const local = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|192\.168\.|10\.)/.test(host);
+  const proto = req.get("x-forwarded-proto") || (local ? req.protocol : "https");
+  return `${proto}://${host}`;
+};
+
+app.get("/.well-known/x402", (req, res) => {
+  const base = publicBase(req);
+  res.json({
+    version: 1,
+    resources: [`${base}/v1/check/:address`],
+    ownershipProofs: [PAY_TO],
+    instructions: `Paid route: GET ${base}/v1/check/<base-address> for ${PRICE} USDC on Base (${NETWORK}). Any x402 v2 client works; no account or API key.`,
+  });
+});
+
 app.get("/health", (_req, res) =>
   res.json({ status: "ok", service: SERVICE, version: VERSION, network: NETWORK, price: PRICE, uptime: process.uptime() }),
 );
-app.get("/openapi.json", (_req, res) =>
+
+app.get("/openapi.json", (req, res) => {
+  const base = publicBase(req);
   res.json({
     openapi: "3.0.3",
     info: { title: SERVICE, version: VERSION, description: catalog().description },
+    "x-discovery": { ownershipProofs: [PAY_TO] },
+    servers: [{ url: base }],
     paths: {
       "/v1/check/{address}": {
         get: {
-          summary: "On-chain due-diligence report",
-          parameters: [{ name: "address", in: "path", required: true, schema: { type: "string" } }],
+          summary: "On-chain due-diligence report for a Base address",
+          operationId: "checkAddress",
+          tags: ["due-diligence", "security", "base"],
+          parameters: [
+            {
+              name: "address",
+              in: "path",
+              required: true,
+              schema: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$" },
+              description: "Base address to screen (contract or EOA)",
+            },
+          ],
+          "x-payment-info": {
+            protocols: ["x402"],
+            price: { mode: "fixed", currency: "USD", amount: "0.01" },
+            network: NETWORK,
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            payTo: PAY_TO,
+          },
           responses: {
-            200: { description: "report" },
-            402: { description: `payment required: ${PRICE} USDC on Base (${NETWORK})` },
+            200: { description: "Screening report", content: { "application/json": { schema: { type: "object" } } } },
+            402: {
+              description: `Payment required: ${PRICE} USDC on Base (${NETWORK})`,
+              headers: { "PAYMENT-REQUIRED": { schema: { type: "string" } } },
+            },
+            400: { description: "Malformed address" },
           },
         },
       },
     },
-  }),
-);
+  });
+});
 
 app.use(paymentMiddleware(routes, resourceServer));
 
